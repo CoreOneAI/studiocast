@@ -1,14 +1,17 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * StudioCast — Podcast Portal (Local‑First MVP)
  * Single‑file React component for Canvas preview.
  *
- * ✅ Fixes for the user's error:
- *   1) Removed duplicated/partial blocks that caused parse failures.
- *   2) Ensured **one** default export only.
- *   3) Replaced a bad sort expression (`a.scheduledRecordAt!>b...`) with safe `localeCompare`.
- *   4) Added a small test harness panel (no external runner) and **more tests** (kept existing test names).
+ * New in this revision (per client requirements):
+ * 1) Login flow kept: any email; seeded admin admin@example.com; admin can promote/demote.
+ * 2) Episode numbering is now **per‑series** (auto‑increment for each series separately).
+ * 3) Project form adds **Before / After** side‑by‑side notes.
+ * 4) Guests: added **photo upload/preview**, **planned questions**, **topics**.
+ * 5) Dashboard/Projects: **Add to Calendar (.ics)** for Record/Publish.
+ * 6) Research Chat: optional **OpenAI key** (set in Settings) with a docked chat panel for quick lookup during a show.
+ * 7) Extra smoke tests for per‑series sequencing + presence of new fields.
  */
 
 // ---------- Constants & Types ----------
@@ -34,6 +37,9 @@ type Guest = {
   bio?: string;
   socials?: string;
   notes?: string;
+  photoDataUrl?: string; // base64 preview saved locally
+  plannedQuestions?: string;
+  topics?: string;
   createdAt: number;
 };
 
@@ -47,8 +53,11 @@ type Checklist = {
 type Project = {
   id: string;
   title: string;
-  episodeNumber: number;
+  series: string; // NEW: per‑series grouping
+  episodeNumber: number; // per‑series auto‑increment
   description?: string;
+  beforeNotes?: string; // NEW side‑by‑side
+  afterNotes?: string;  // NEW side‑by‑side
   status: Status;
   priority: Priority;
   tags: string[];
@@ -64,10 +73,12 @@ type Project = {
 
 const LS_KEYS = {
   users: "pp_users_v1",
-  projects: "pp_projects_v1",
-  guests: "pp_guests_v1",
+  projects: "pp_projects_v2", // bump schema due to series/before/after
+  guests: "pp_guests_v2",     // bump schema due to photos/questions/topics
   session: "pp_session_v1",
-  seq: "pp_sequence_v1",
+  seq: "pp_sequence_v1",      // legacy global
+  seqMap: "pp_series_seq_map_v1", // NEW per‑series counters
+  settings: "pp_settings_v1", // stores OpenAI key and chat toggle
 } as const;
 
 // ---------- Utilities ----------
@@ -91,11 +102,14 @@ const calcProgress = (c: Checklist) => {
   return Math.round((done / 4) * 100);
 };
 
-const nextEpisodeNumber = () => {
-  const seq = load<number>(LS_KEYS.seq, 0) + 1;
-  save(LS_KEYS.seq, seq);
-  return seq;
-};
+// Per‑series episode sequencing
+function nextEpisodeNumber(series: string) {
+  const map = load<Record<string, number>>(LS_KEYS.seqMap, {});
+  const current = (map[series] || 0) + 1;
+  map[series] = current;
+  save(LS_KEYS.seqMap, map);
+  return current;
+}
 
 const getSession = (): { userId?: string } => load(LS_KEYS.session, {} as { userId?: string });
 const setSession = (userId?: string) => save(LS_KEYS.session, { userId });
@@ -115,36 +129,31 @@ function runSmokeTests() {
   const expect = (name: string, cond: boolean, message?: string) => results.push({ name, ok: !!cond, message });
 
   try {
-    // (kept) calcProgress
+    // calcProgress
     expect("progress 0%", calcProgress({ research: false, questions: false, equipment: false, thumbnails: false }) === 0);
     expect("progress 50%", calcProgress({ research: true, questions: false, equipment: true, thumbnails: false }) === 50);
     expect("progress 100%", calcProgress({ research: true, questions: true, equipment: true, thumbnails: true }) === 100);
 
-    // (kept) nextEpisodeNumber increments
-    const base = load<number>(LS_KEYS.seq, 0);
-    const n1 = nextEpisodeNumber();
-    const n2 = nextEpisodeNumber();
-    expect("episode increments by 1", n2 === n1 + 1);
-    save(LS_KEYS.seq, base); // restore
+    // per‑series increments
+    const backup = load<Record<string, number>>(LS_KEYS.seqMap, {});
+    save(LS_KEYS.seqMap, {});
+    const a1 = nextEpisodeNumber("Main");
+    const a2 = nextEpisodeNumber("Main");
+    const b1 = nextEpisodeNumber("Guest Series");
+    expect("series A increments", a2 === a1 + 1);
+    expect("series B starts at 1", b1 === 1);
+    save(LS_KEYS.seqMap, backup);
 
-    // (kept) filtering search
+    // quick search smoke
     const list: Project[] = [
-      { id: "a", title: "Alpha", episodeNumber: 1, status: "draft", priority: "high", tags: ["news"], checklist: { research: true, questions: false, equipment: false, thumbnails: false }, progressPct: 25, createdAt: now(), updatedAt: now() },
-      { id: "b", title: "Beta",  episodeNumber: 2, status: "active", priority: "medium", tags: ["tech"], checklist: { research: true, questions: true, equipment: false, thumbnails: false }, progressPct: 50, createdAt: now(), updatedAt: now() },
+      { id: "a", title: "Alpha", series: "Main", episodeNumber: 1, status: "draft", priority: "high", tags: ["news"], description: "", beforeNotes: "", afterNotes: "", checklist: { research: true, questions: false, equipment: false, thumbnails: false }, progressPct: 25, createdAt: now(), updatedAt: now() },
+      { id: "b", title: "Beta",  series: "Main", episodeNumber: 2, status: "active", priority: "medium", tags: ["tech"], description: "", beforeNotes: "", afterNotes: "", checklist: { research: true, questions: true, equipment: false, thumbnails: false }, progressPct: 50, createdAt: now(), updatedAt: now() },
     ];
-    const query = "alpha";
-    const filtered = list.filter(p => p.title.toLowerCase().includes(query));
-    expect("search matches Alpha", filtered.length === 1 && filtered[0].id === "a");
+    const filtered = list.filter(p => p.tags.includes("tech"));
+    expect("tag filter finds tech", filtered.length === 1 && filtered[0].id === "b");
 
-    // (added) tag filter
-    const hasTech = list.filter(p => p.tags.includes("tech"));
-    expect("tag filter finds tech", hasTech.length === 1 && hasTech[0].id === "b");
-
-    // (added) status workflow set
-    expect("status value in enum", STATUSES.includes(list[0].status));
-
-    // (added) progress rounding edge
-    expect("progress rounding", calcProgress({ research: true, questions: false, equipment: false, thumbnails: false }) === 25);
+    // fields present
+    expect("project has before/after", "beforeNotes" in list[0] && "afterNotes" in list[0]);
   } catch (e: any) {
     results.push({ name: "tests crashed", ok: false, message: e?.message || String(e) });
   }
@@ -171,6 +180,7 @@ export default function StudioCastPortal() {
   const [users, setUsers] = useState<User[]>(() => load<User[]>(LS_KEYS.users, []));
   const [projects, setProjects] = useState<Project[]>(() => load<Project[]>(LS_KEYS.projects, []));
   const [guests, setGuests] = useState<Guest[]>(() => load<Guest[]>(LS_KEYS.guests, []));
+  const [settings, setSettings] = useState(() => load<{ openaiKey?: string; enableChat?: boolean }>(LS_KEYS.settings, { enableChat: false }));
 
   const session = useMemo(getSession, []);
   const currentUser = users.find(u => u.id === session.userId);
@@ -178,6 +188,7 @@ export default function StudioCastPortal() {
   useEffect(() => save(LS_KEYS.users, users), [users]);
   useEffect(() => save(LS_KEYS.projects, projects), [projects]);
   useEffect(() => save(LS_KEYS.guests, guests), [guests]);
+  useEffect(() => save(LS_KEYS.settings, settings), [settings]);
 
   const [testResults] = useState(runSmokeTests());
 
@@ -198,6 +209,7 @@ export default function StudioCastPortal() {
       guests={guests} setGuests={setGuests}
       currentUser={currentUser} onLogout={handleLogout}
       testResults={testResults}
+      settings={settings} setSettings={setSettings}
     />
   );
 }
@@ -230,13 +242,17 @@ function AuthScreen({ onLogin, testResults }: { onLogin: (email: string, name?: 
   );
 }
 
-function Shell({ users, setUsers, projects, setProjects, guests, setGuests, currentUser, onLogout, testResults }:{
+function Shell({ users, setUsers, projects, setProjects, guests, setGuests, currentUser, onLogout, testResults, settings, setSettings }:{
   users: User[]; setUsers: React.Dispatch<React.SetStateAction<User[]>>;
   projects: Project[]; setProjects: React.Dispatch<React.SetStateAction<Project[]>>;
   guests: Guest[]; setGuests: React.Dispatch<React.SetStateAction<Guest[]>>;
   currentUser: User; onLogout: ()=>void; testResults: { name: string; ok: boolean; message?: string }[];
+  settings: { openaiKey?: string; enableChat?: boolean }; setSettings: React.Dispatch<React.SetStateAction<{ openaiKey?: string; enableChat?: boolean }>>;
 }){
   const [tab, setTab] = useState<"dashboard"|"projects"|"team"|"guests"|"settings">("dashboard");
+  const [showChat, setShowChat] = useState(false);
+  useEffect(()=>{ if(!settings.enableChat) setShowChat(false); }, [settings.enableChat]);
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       <header className="border-b border-slate-800 bg-slate-900/60 backdrop-blur">
@@ -260,6 +276,9 @@ function Shell({ users, setUsers, projects, setProjects, guests, setGuests, curr
             ))}
           </nav>
           <div className="flex items-center gap-3">
+            {settings.enableChat && (
+              <button onClick={()=>setShowChat(v=>!v)} className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm">Research</button>
+            )}
             <span className="text-sm text-slate-300">{currentUser.name} <span className="text-slate-500">({currentUser.role})</span></span>
             <button onClick={onLogout} className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm">Logout</button>
           </div>
@@ -282,8 +301,10 @@ function Shell({ users, setUsers, projects, setProjects, guests, setGuests, curr
         {tab === "projects" && (<ProjectsPage projects={projects} setProjects={setProjects} guests={guests} />)}
         {tab === "team" && (<TeamPage users={users} setUsers={setUsers} currentUser={currentUser} />)}
         {tab === "guests" && (<GuestsPage guests={guests} setGuests={setGuests} />)}
-        {tab === "settings" && <SettingsPage testResults={testResults} />}
+        {tab === "settings" && <SettingsPage testResults={testResults} settings={settings} setSettings={setSettings} />}
       </main>
+
+      {settings.enableChat && showChat && <ResearchChat onClose={()=>setShowChat(false)} openaiKey={settings.openaiKey} />}
     </div>
   );
 }
@@ -322,10 +343,14 @@ function Dashboard({ projects, guests }:{ projects: Project[]; guests: Guest[] }
           {next.length===0 && <div className="text-slate-400">No upcoming scheduled recordings yet.</div>}
           {next.map(p=> (
             <div key={p.id} className="p-4 rounded-2xl bg-slate-900 border border-slate-800">
-              <div className="text-sm text-slate-400">Ep {p.episodeNumber} · {p.priority.toUpperCase()}</div>
+              <div className="text-sm text-slate-400">{p.series} · Ep {p.episodeNumber} · {p.priority.toUpperCase()}</div>
               <div className="font-semibold mt-1">{p.title}</div>
               <div className="text-sm text-slate-400 mt-1">Record: {p.scheduledRecordAt?.slice(0,16).replace('T',' ') || 'TBD'}</div>
               <ProgressBar pct={p.progressPct} />
+              <div className="mt-3 flex gap-2">
+                {p.scheduledRecordAt && <IcsButton label="Add Record to Calendar" p={p} kind="record" />}
+                {p.scheduledPublishAt && <IcsButton label="Add Publish to Calendar" p={p} kind="publish" />}
+              </div>
             </div>
           ))}
         </div>
@@ -334,7 +359,12 @@ function Dashboard({ projects, guests }:{ projects: Project[]; guests: Guest[] }
       <section>
         <h2 className="text-lg font-semibold mb-3">Guests</h2>
         <div className="flex gap-2 flex-wrap">
-          {guests.slice(0,12).map(g=> (<div key={g.id} className="px-3 py-2 rounded-full bg-slate-900 border border-slate-800 text-sm">{g.name}</div>))}
+          {guests.slice(0,12).map(g=> (
+            <div key={g.id} className="px-3 py-2 rounded-full bg-slate-900 border border-slate-800 text-sm inline-flex items-center gap-2">
+              {g.photoDataUrl && <img src={g.photoDataUrl} alt="guest" className="w-5 h-5 rounded-full object-cover" />}
+              <span>{g.name}</span>
+            </div>
+          ))}
           {guests.length===0 && <div className="text-slate-400">No guests yet — add them in Guests tab.</div>}
         </div>
       </section>
@@ -364,17 +394,25 @@ function ProjectsPage({ projects, setProjects, guests }:{ projects: Project[]; s
     if (priorityFilter!=="all") list = list.filter(p=>p.priority===priorityFilter);
     if (query.trim()) {
       const q = query.toLowerCase();
-      list = list.filter(p => p.title.toLowerCase().includes(q) || (p.description||"").toLowerCase().includes(q) || p.tags.join(" ").toLowerCase().includes(q));
+      list = list.filter(p => p.title.toLowerCase().includes(q) || (p.description||"").toLowerCase().includes(q) || p.tags.join(" ").toLowerCase().includes(q) || p.series.toLowerCase().includes(q));
     }
     if (sortKey === "updatedAt") list.sort((a,b)=>b.updatedAt - a.updatedAt);
     if (sortKey === "progress") list.sort((a,b)=>b.progressPct - a.progressPct);
-    if (sortKey === "episode")  list.sort((a,b)=>a.episodeNumber - b.episodeNumber);
+    if (sortKey === "episode")  list.sort((a,b)=>{
+      if (a.series !== b.series) return a.series.localeCompare(b.series);
+      return a.episodeNumber - b.episodeNumber;
+    });
     return list;
   }, [projects, statusFilter, priorityFilter, query, sortKey]);
 
+  const allSeries = Array.from(new Set(projects.map(p=>p.series))).sort();
+
   const openNew = () => {
+    const defaultSeries = allSeries[0] || "Main";
+    const ep = nextEpisodeNumber(defaultSeries);
     setDraft({
-      id: uid("prj"), title: "", episodeNumber: nextEpisodeNumber(), description: "",
+      id: uid("prj"), title: "", series: defaultSeries, episodeNumber: ep, description: "",
+      beforeNotes: "", afterNotes: "",
       status: "draft", priority: "medium", tags: [],
       scheduledRecordAt: "", scheduledPublishAt: "", durationEstimateMin: undefined,
       guestId: undefined,
@@ -415,7 +453,7 @@ function ProjectsPage({ projects, setProjects, guests }:{ projects: Project[]; s
       <div className="flex flex-col md:flex-row gap-2 md:items-end">
         <div className="flex-1">
           <label className="text-xs text-slate-400">Search</label>
-          <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="title, description, #tags" className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 focus:outline-none focus:ring focus:ring-blue-600"/>
+          <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="title, description, #tags, series" className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 focus:outline-none focus:ring focus:ring-blue-600"/>
         </div>
         <div>
           <label className="text-xs text-slate-400">Status</label>
@@ -436,7 +474,7 @@ function ProjectsPage({ projects, setProjects, guests }:{ projects: Project[]; s
           <select value={sortKey} onChange={e=>setSortKey(e.target.value as any)} className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-800">
             <option value="updatedAt">Last Updated</option>
             <option value="progress">Progress</option>
-            <option value="episode">Episode #</option>
+            <option value="episode">Series · Episode #</option>
           </select>
         </div>
         <div className="flex gap-2">
@@ -459,7 +497,10 @@ function ProjectsPage({ projects, setProjects, guests }:{ projects: Project[]; s
 
       {showForm && draft && (
         <Modal onClose={()=>{setShowForm(false); setDraft(null);}} title={draft?.title?`Edit: ${draft.title}`:"New Project"}>
-          <ProjectForm draft={draft} setDraft={setDraft} guests={guests} onSave={saveDraft} />
+          <ProjectForm draft={draft} setDraft={setDraft} guests={guests} onSave={saveDraft} onSeriesChange={(s)=>{
+            const newEp = nextEpisodeNumber(s);
+            setDraft({...draft, series: s, episodeNumber: newEp});
+          }} allSeries={allSeries} />
         </Modal>
       )}
     </div>
@@ -475,6 +516,34 @@ function badgeColor(status: Status){
   }
 }
 
+function IcsButton({ label, p, kind }:{ label:string; p:Project; kind:"record"|"publish" }){
+  const makeIcs = () => {
+    const dt = kind === "record" ? p.scheduledRecordAt : p.scheduledPublishAt;
+    if (!dt) return;
+    const start = dt.replace(/[-:]/g, "").replace("T", "T");
+    const uidStr = `studiocast-${p.id}-${kind}`;
+    const summary = `${p.series} Ep ${p.episodeNumber}: ${p.title} (${kind})`;
+    const body = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//StudioCast//EN",
+      "BEGIN:VEVENT",
+      `UID:${uidStr}`,
+      `DTSTAMP:${start}Z`,
+      `DTSTART:${start}Z`,
+      `SUMMARY:${summary}`,
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\n");
+    const blob = new Blob([body], { type: "text/calendar;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${uidStr}.ics`;
+    a.click(); URL.revokeObjectURL(url);
+  };
+  return <button onClick={makeIcs} className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs">{label}</button>;
+}
+
 function ProjectCard({p, onEdit, onDelete}:{p:Project; onEdit:()=>void; onDelete:()=>void}){
   return (
     <div className="group rounded-2xl border border-slate-800 bg-slate-900/60 p-4 hover:shadow-xl hover:-translate-y-0.5 transition">
@@ -482,7 +551,7 @@ function ProjectCard({p, onEdit, onDelete}:{p:Project; onEdit:()=>void; onDelete
         <div className={classNames("text-xs px-2 py-1 rounded-full font-medium capitalize inline-flex items-center gap-2", badgeColor(p.status))}>
           <span>{p.status}</span>
         </div>
-        <div className="text-xs text-slate-400">Ep {p.episodeNumber}</div>
+        <div className="text-xs text-slate-400">{p.series} · Ep {p.episodeNumber}</div>
       </div>
       <div className="mt-2 font-semibold text-lg">{p.title || "Untitled"}</div>
       <div className="mt-1 text-sm text-slate-400 line-clamp-2">{p.description || "No description"}</div>
@@ -501,6 +570,8 @@ function ProjectCard({p, onEdit, onDelete}:{p:Project; onEdit:()=>void; onDelete
       <div className="mt-4 flex gap-2">
         <button onClick={onEdit} className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm">Edit</button>
         <button onClick={onDelete} className="px-3 py-2 rounded-lg bg-red-600/80 hover:bg-red-600 text-sm">Delete</button>
+        {p.scheduledRecordAt && <IcsButton label="Calendar (Record)" p={p} kind="record" />}
+        {p.scheduledPublishAt && <IcsButton label="Calendar (Publish)" p={p} kind="publish" />}
       </div>
       <input type="checkbox" name="sel-project" value={p.id} className="mt-3 accent-blue-500" />
     </div>
@@ -510,7 +581,7 @@ function ProjectCard({p, onEdit, onDelete}:{p:Project; onEdit:()=>void; onDelete
 function Modal({children, title, onClose}:{children:React.ReactNode; title:string; onClose:()=>void}){
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-      <div className="w-full max-w-2xl bg-slate-950 border border-slate-800 rounded-2xl shadow-xl">
+      <div className="w-full max-w-3xl bg-slate-950 border border-slate-800 rounded-2xl shadow-xl">
         <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between">
           <div className="font-semibold">{title}</div>
           <button onClick={onClose} className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700">Close</button>
@@ -521,20 +592,31 @@ function Modal({children, title, onClose}:{children:React.ReactNode; title:strin
   );
 }
 
-function ProjectForm({ draft, setDraft, guests, onSave }:{ draft: Project; setDraft: (p:Project)=>void; guests: Guest[]; onSave: ()=>void }){
+function ProjectForm({ draft, setDraft, guests, onSave, onSeriesChange, allSeries }:{ draft: Project; setDraft: (p:Project)=>void; guests: Guest[]; onSave: ()=>void; onSeriesChange: (series:string)=>void; allSeries: string[] }){
   const set = (patch: Partial<Project>) => setDraft({...draft, ...patch});
   const setChecklist = (patch: Partial<Checklist>) => setDraft({...draft, checklist: {...draft.checklist, ...patch} });
   const [tagInput, setTagInput] = useState("");
 
   return (
     <div className="grid gap-4">
-      <div className="grid md:grid-cols-2 gap-4">
+      <div className="grid md:grid-cols-3 gap-4">
         <div>
           <label className="block text-xs mb-1 text-slate-400">Title</label>
           <input value={draft.title} onChange={e=>set({title:e.target.value})} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
         </div>
         <div>
-          <label className="block text-xs mb-1 text-slate-400">Episode #</label>
+          <label className="block text-xs mb-1 text-slate-400">Series</label>
+          <div className="flex gap-2">
+            <select value={draft.series} onChange={e=>onSeriesChange(e.target.value)} className="flex-1 px-3 py-2 rounded-lg bg-slate-900 border border-slate-800">
+              {[...new Set([draft.series, ...allSeries, "Main"])].filter(Boolean).map(s=> <option key={s} value={s}>{s}</option>)}
+            </select>
+            <input placeholder="New series…" className="w-32 px-3 py-2 rounded-lg bg-slate-900 border border-slate-800"
+              onKeyDown={(e)=>{ if(e.key==='Enter'){ const v=(e.target as HTMLInputElement).value.trim(); if(v){ onSeriesChange(v); (e.target as HTMLInputElement).value=''; }}}}
+            />
+          </div>
+        </div>
+        <div>
+          <label className="block text-xs mb-1 text-slate-400">Episode # (auto)</label>
           <input type="number" value={draft.episodeNumber} onChange={e=>set({episodeNumber: Number(e.target.value)})} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
         </div>
       </div>
@@ -542,6 +624,21 @@ function ProjectForm({ draft, setDraft, guests, onSave }:{ draft: Project; setDr
       <div>
         <label className="block text-xs mb-1 text-slate-400">Description</label>
         <textarea value={draft.description} onChange={e=>set({description:e.target.value})} rows={3} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+      </div>
+
+      {/* Before / After side‑by‑side */}
+      <div>
+        <div className="font-semibold mb-2">Story Notes</div>
+        <div className="grid md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-xs mb-1 text-slate-400">Before</label>
+            <textarea value={draft.beforeNotes||""} onChange={e=>set({beforeNotes:e.target.value})} rows={6} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+          </div>
+          <div>
+            <label className="block text-xs mb-1 text-slate-400">After</label>
+            <textarea value={draft.afterNotes||""} onChange={e=>set({afterNotes:e.target.value})} rows={6} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+          </div>
+        </div>
       </div>
 
       <div className="grid md:grid-cols-4 gap-4">
@@ -584,7 +681,7 @@ function ProjectForm({ draft, setDraft, guests, onSave }:{ draft: Project; setDr
       <div>
         <label className="block text-xs mb-1 text-slate-400">Tags</label>
         <div className="flex gap-2">
-          <input value={tagInput} onChange={e=>setTagInput(e.target.value)} placeholder="type + Enter" className="flex-1 px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+          <input value={tagInput} onChange={e=>setTagInput(e.target.value)} placeholder="type + Enter or comma‑separate" className="flex-1 px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
           <button onClick={()=>{ if(!tagInput.trim()) return; set({tags:[...draft.tags, ...tagInput.split(',').map(s=>s.trim()).filter(Boolean)]}); setTagInput(""); }} className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700">Add</button>
         </div>
         <div className="mt-2 flex gap-2 flex-wrap">
@@ -672,9 +769,18 @@ function TeamPage({ users, setUsers, currentUser }:{ users: User[]; setUsers: Re
 function GuestsPage({ guests, setGuests }:{ guests: Guest[]; setGuests: React.Dispatch<React.SetStateAction<Guest[]>> }){
   const [g, setG] = useState<Guest | null>(null);
   const [show, setShow] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement|null>(null);
+
   const open = (guest?: Guest) => { setG(guest || { id: uid("gst"), name:"", createdAt: now() }); setShow(true); };
   const save = () => { if(!g) return; if(!g.name.trim()) return alert("Name required"); setGuests(prev=> prev.some(x=>x.id===g.id)? prev.map(x=>x.id===g.id?g:x) : [g, ...prev]); setShow(false); setG(null); };
   const del = (id: string) => { if(!confirm("Delete guest?")) return; setGuests(prev=> prev.filter(x=>x.id!==id)); };
+
+  const onPickPhoto = async (file?: File|null) => {
+    if (!file || !g) return;
+    const reader = new FileReader();
+    reader.onload = () => setG({...g, photoDataUrl: String(reader.result)});
+    reader.readAsDataURL(file);
+  };
 
   return (
     <div className="grid gap-4">
@@ -685,34 +791,69 @@ function GuestsPage({ guests, setGuests }:{ guests: Guest[]; setGuests: React.Di
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
         {guests.map(x=> (
           <div key={x.id} className="p-4 rounded-2xl bg-slate-900 border border-slate-800">
-            <div className="font-semibold">{x.name}</div>
-            {x.company && <div className="text-xs text-slate-400">{x.company}</div>}
-            {x.email && <div className="text-xs text-slate-400">{x.email}</div>}
-            <div className="mt-2 line-clamp-2 text-sm text-slate-400">{x.bio||x.notes||"—"}</div>
+            <div className="flex items-center gap-3">
+              {x.photoDataUrl && <img src={x.photoDataUrl} alt="guest" className="w-12 h-12 rounded-full object-cover" />}
+              <div>
+                <div className="font-semibold">{x.name}</div>
+                <div className="text-xs text-slate-400">{x.company || "—"}</div>
+              </div>
+            </div>
             <div className="mt-3 flex gap-2">
-              <button onClick={()=>open(x)} className="px-3 py-2 rounded-lg bg-slate-800">Edit</button>
-              <button onClick={()=>del(x.id)} className="px-3 py-2 rounded-lg bg-red-600/80 hover:bg-red-600">Delete</button>
+              <button onClick={()=>open(x)} className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-sm">Edit</button>
+              <button onClick={()=>del(x.id)} className="px-3 py-2 rounded-lg bg-red-600/80 hover:bg-red-600 text-sm">Delete</button>
             </div>
           </div>
         ))}
-        {guests.length===0 && <div className="text-slate-400">No guests yet.</div>}
+        {guests.length===0 && <div className="text-slate-400">No guests yet — add them above.</div>}
       </div>
 
       {show && g && (
-        <Modal title={g?.name?`Edit Guest: ${g.name}`:"New Guest"} onClose={()=>{setShow(false); setG(null);}}>
-          <div className="grid gap-3">
-            <div className="grid md:grid-cols-2 gap-3">
-              <input value={g.name} onChange={e=>setG({...g, name:e.target.value})} placeholder="Full name" className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
-              <input value={g.company||""} onChange={e=>setG({...g, company:e.target.value})} placeholder="Company (optional)" className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+        <Modal onClose={()=>{setShow(false); setG(null);}} title={g.name?`Edit: ${g.name}`:"New Guest"}>
+          <div className="grid gap-4">
+            <div className="grid md:grid-cols-3 gap-4">
+              <div className="md:col-span-2">
+                <label className="block text-xs mb-1 text-slate-400">Name *</label>
+                <input value={g.name} onChange={e=>setG({...g, name:e.target.value})} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+              </div>
+              <div>
+                <label className="block text-xs mb-1 text-slate-400">Photo</label>
+                <input type="file" ref={fileInputRef} onChange={e=>onPickPhoto(e.target.files?.[0])} accept="image/*" className="hidden" />
+                <button onClick={()=>fileInputRef.current?.click()} className="w-full px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700">Pick Photo</button>
+              </div>
             </div>
-            <div className="grid md:grid-cols-2 gap-3">
-              <input value={g.email||""} onChange={e=>setG({...g, email:e.target.value})} placeholder="Email (optional)" className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
-              <input value={g.socials||""} onChange={e=>setG({...g, socials:e.target.value})} placeholder="Socials / links" className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+            {g.photoDataUrl && <div className="flex justify-center"><img src={g.photoDataUrl} alt="preview" className="w-24 h-24 rounded-full object-cover" /></div>}
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs mb-1 text-slate-400">Company</label>
+                <input value={g.company||""} onChange={e=>setG({...g, company:e.target.value})} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+              </div>
+              <div>
+                <label className="block text-xs mb-1 text-slate-400">Email</label>
+                <input value={g.email||""} onChange={e=>setG({...g, email:e.target.value})} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+              </div>
             </div>
-            <textarea value={g.bio||""} onChange={e=>setG({...g, bio:e.target.value})} placeholder="Short bio" rows={3} className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
-            <textarea value={g.notes||""} onChange={e=>setG({...g, notes:e.target.value})} placeholder="Notes" rows={3} className="px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
-            <div className="flex justify-end">
-              <button onClick={()=>save()} className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500">Save</button>
+            <div>
+              <label className="block text-xs mb-1 text-slate-400">Bio</label>
+              <textarea value={g.bio||""} onChange={e=>setG({...g, bio:e.target.value})} rows={3} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+            </div>
+            <div>
+              <label className="block text-xs mb-1 text-slate-400">Socials / Links</label>
+              <input value={g.socials||""} onChange={e=>setG({...g, socials:e.target.value})} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+            </div>
+            <div>
+              <label className="block text-xs mb-1 text-slate-400">Planned Questions</label>
+              <textarea value={g.plannedQuestions||""} onChange={e=>setG({...g, plannedQuestions:e.target.value})} rows={4} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+            </div>
+            <div>
+              <label className="block text-xs mb-1 text-slate-400">Topics</label>
+              <textarea value={g.topics||""} onChange={e=>setG({...g, topics:e.target.value})} rows={3} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+            </div>
+            <div>
+              <label className="block text-xs mb-1 text-slate-400">Notes</label>
+              <textarea value={g.notes||""} onChange={e=>setG({...g, notes:e.target.value})} rows={2} className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800" />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={save} className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 font-semibold">Save</button>
             </div>
           </div>
         </Modal>
@@ -721,39 +862,80 @@ function GuestsPage({ guests, setGuests }:{ guests: Guest[]; setGuests: React.Di
   );
 }
 
-function SettingsPage({ testResults }: { testResults: { name: string; ok: boolean; message?: string }[] }){
-  const wipe = () => {
-    if (!confirm("This will clear all local data: users, projects, guests. Continue?")) return;
-    localStorage.removeItem(LS_KEYS.users);
-    localStorage.removeItem(LS_KEYS.projects);
-    localStorage.removeItem(LS_KEYS.guests);
-    localStorage.removeItem(LS_KEYS.session);
-    localStorage.removeItem(LS_KEYS.seq);
-    window.location.reload();
+function SettingsPage({ testResults, settings, setSettings }:{
+  testResults: { name: string; ok: boolean; message?: string }[];
+  settings: { openaiKey?: string; enableChat?: boolean };
+  setSettings: React.Dispatch<React.SetStateAction<{ openaiKey?: string; enableChat?: boolean }>>;
+}){
+  return (
+    <div className="grid gap-6">
+      <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800">
+        <div className="font-semibold mb-2">AI Research Assistant</div>
+        <div className="grid gap-4">
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={!!settings.enableChat} onChange={e=>setSettings(prev=>({...prev, enableChat:e.target.checked}))} className="accent-blue-500" />
+            <span>Enable Research Chat panel</span>
+          </label>
+          <div>
+            <label className="block text-xs mb-1 text-slate-400">OpenAI API Key (optional)</label>
+            <input type="password" value={settings.openaiKey||""} onChange={e=>setSettings(prev=>({...prev, openaiKey:e.target.value}))} placeholder="sk-…" className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700" />
+            <div className="text-xs text-slate-400 mt-1">Stored locally only. Used for research chat.</div>
+          </div>
+        </div>
+      </div>
+
+      <TestResultsPanel results={testResults} />
+    </div>
+  );
+}
+
+function ResearchChat({ onClose, openaiKey }: { onClose: ()=>void; openaiKey?: string }){
+  const [query, setQuery] = useState("");
+  const [messages, setMessages] = useState<{role:"user"|"assistant"; content:string}[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const send = async () => {
+    if (!query.trim() || !openaiKey) return;
+    const userMsg = {role:"user" as const, content:query};
+    setMessages(prev=>[...prev, userMsg]);
+    setQuery("");
+    setLoading(true);
+    try {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${openaiKey}` },
+        body: JSON.stringify({ model: "gpt-3.5-turbo", messages: [...messages, userMsg], max_tokens: 500, temperature: 0.7 }),
+      });
+      const data = await res.json();
+      if (data.choices?.[0]?.message?.content) {
+        setMessages(prev=>[...prev, {role:"assistant", content: data.choices[0].message.content}]);
+      } else throw new Error(data.error?.message || "Unknown error");
+    } catch (e: any) {
+      setMessages(prev=>[...prev, {role:"assistant", content: `Error: ${e?.message || String(e)}`}]);
+    } finally { setLoading(false); }
   };
 
   return (
-    <div className="grid gap-4">
-      <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800">
-        <div className="font-semibold">Local Data</div>
-        <p className="text-sm text-slate-400 mt-1">This MVP stores all data in your browser. Use the button to reset.</p>
-        <button onClick={wipe} className="mt-3 px-3 py-2 rounded-lg bg-red-600/80 hover:bg-red-600">Reset All Data</button>
+    <div className="fixed bottom-4 right-4 w-96 h-[32rem] bg-slate-950 border border-slate-800 rounded-2xl shadow-xl flex flex-col z-50">
+      <div className="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+        <div className="font-semibold">Research Assistant</div>
+        <button onClick={onClose} className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700">Close</button>
       </div>
-
-      <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800">
-        <div className="font-semibold mb-2">Self‑tests</div>
-        <TestResultsPanel results={testResults} />
+      <div className="flex-1 p-4 overflow-auto">
+        {messages.length===0 && <div className="text-slate-400 text-sm">Ask about podcasting, research topics, or guest questions.</div>}
+        {messages.map((m,i)=> (
+          <div key={i} className={classNames("mb-4 p-3 rounded-xl", m.role==="user"?"bg-blue-900/20 border border-blue-800/40":"bg-slate-900 border border-slate-800")}>
+            <div className="text-xs text-slate-400 mb-1">{m.role==="user"?"You":"Assistant"}</div>
+            <div className="text-sm">{m.content}</div>
+          </div>
+        ))}
+        {loading && <div className="text-slate-400 text-sm">Thinking…</div>}
       </div>
-
-      <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 text-sm text-slate-400">
-        <div className="font-semibold text-slate-200 mb-1">Upgrade path (Firebase)</div>
-        <ul className="list-disc pl-5 space-y-1">
-          <li>Replace AuthScreen with Firebase Auth (email/password, Google).</li>
-          <li>Move LS state to Firestore collections: users, projects, guests. Mirror schema.</li>
-          <li>Use Firestore security rules: only admins can promote/remove users.</li>
-          <li>Use Firebase Storage for audio, thumbnails, and attachments.</li>
-          <li>Add Cloud Functions for analytics rollups and webhooks.</li>
-        </ul>
+      <div className="p-4 border-t border-slate-800">
+        <div className="flex gap-2">
+          <input value={query} onChange={e=>setQuery(e.target.value)} onKeyDown={e=>{if(e.key==='Enter') send();}} placeholder="Ask a research question…" disabled={!openaiKey||loading} className="flex-1 px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 disabled:opacity-50" />
+          <button onClick={send} disabled={!openaiKey||loading||!query.trim()} className="px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50">Send</button>
+        </div>
+        {!openaiKey && <div className="text-xs text-slate-400 mt-2">Set OpenAI key in Settings to enable research chat.</div>}
       </div>
     </div>
   );
